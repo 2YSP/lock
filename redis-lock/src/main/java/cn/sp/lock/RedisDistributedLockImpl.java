@@ -1,16 +1,17 @@
 package cn.sp.lock;
 
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import javax.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.core.io.ClassPathResource;
+import org.springframework.data.redis.connection.RedisStringCommands.SetOption;
+import org.springframework.data.redis.connection.ReturnType;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
-import org.springframework.scripting.support.ResourceScriptSource;
+import org.springframework.data.redis.core.types.Expiration;
 import org.springframework.stereotype.Component;
 
 /**
@@ -24,30 +25,34 @@ public class RedisDistributedLockImpl implements IRedisDistributedLock {
   /**
    * key前缀
    */
-  public static final String PREFIX = "Lock_";
+  public static final String PREFIX = "Lock:";
   /**
    * 保存锁的value
    */
   private ThreadLocal<String> threadLocal = new ThreadLocal<>();
 
+  private static final Charset UTF8 = Charset.forName("UTF-8");
+  /**
+   * 释放锁脚本
+   */
+  private static final String UNLOCK_LUA;
+
+  /*
+   * 释放锁脚本，原子操作
+   */
+  static {
+    StringBuilder sb = new StringBuilder();
+    sb.append("if redis.call(\"get\",KEYS[1]) == ARGV[1] ");
+    sb.append("then ");
+    sb.append("    return redis.call(\"del\",KEYS[1]) ");
+    sb.append("else ");
+    sb.append("    return 0 ");
+    sb.append("end ");
+    UNLOCK_LUA = sb.toString();
+  }
+
   @Autowired
   private RedisTemplate redisTemplate;
-
-  private DefaultRedisScript<Long> lockRedisScript;
-  private DefaultRedisScript<Long> releaseRedisScript;
-
-  @PostConstruct
-  public void init() {
-    lockRedisScript = new DefaultRedisScript<>();
-    lockRedisScript.setResultType(Long.class);
-    lockRedisScript
-        .setScriptSource(new ResourceScriptSource(new ClassPathResource("/requireLock.lua")));
-
-    releaseRedisScript = new DefaultRedisScript<>();
-    releaseRedisScript.setResultType(Long.class);
-    releaseRedisScript
-        .setScriptSource(new ResourceScriptSource(new ClassPathResource("/releaseLock.lua")));
-  }
 
   @Override
   public boolean lock(String key, long requireTimeOut, long lockTimeOut, int retries) {
@@ -58,7 +63,6 @@ public class RedisDistributedLockImpl implements IRedisDistributedLock {
     }
     String value = UUID.randomUUID().toString();
     long end = System.currentTimeMillis() + requireTimeOut;
-    int expire = (int) (lockTimeOut / 1000);
     int retryTimes = 1;
 
     try {
@@ -67,7 +71,7 @@ public class RedisDistributedLockImpl implements IRedisDistributedLock {
           log.error(" require lock failed,retry times [{}]", retries);
           return false;
         }
-        if (setNX(wrapLockKey(key), value, expire)) {
+        if (setNX(wrapLockKey(key), value, lockTimeOut)) {
           threadLocal.set(value);
           return true;
         }
@@ -82,19 +86,21 @@ public class RedisDistributedLockImpl implements IRedisDistributedLock {
     return false;
   }
 
-  private boolean setNX(String key, String value, int expire) {
+  private boolean setNX(String key, String value, long expire) {
     /**
      * List设置lua的keys
      */
     List<String> keyList = new ArrayList<>();
     keyList.add(key);
-    //返回结果为NULL
-    Long result = (Long) redisTemplate.execute(lockRedisScript, keyList, expire, value);
+    return (boolean) redisTemplate.execute((RedisCallback<Boolean>) connection -> {
+      Boolean result = connection
+          .set(key.getBytes(UTF8),
+              value.getBytes(UTF8),
+              Expiration.milliseconds(expire),
+              SetOption.SET_IF_ABSENT);
+      return result;
+    });
 
-    if (result == null || result != 0) {
-      return true;
-    }
-    return false;
   }
 
   /**
@@ -111,10 +117,11 @@ public class RedisDistributedLockImpl implements IRedisDistributedLock {
     if (StringUtils.isBlank(originValue)) {
       return false;
     }
-    List<String> keyList = new ArrayList<>();
-    keyList.add(wrapLockKey(key));
-    Long result = (Long) redisTemplate.execute(releaseRedisScript, keyList, originValue);
-    return result > 0;
+    return (boolean) redisTemplate.execute((RedisCallback<Boolean>) connection -> {
+      return connection
+          .eval(UNLOCK_LUA.getBytes(UTF8), ReturnType.BOOLEAN, 1, wrapLockKey(key).getBytes(UTF8),
+              originValue.getBytes(UTF8));
+    });
   }
 
 
